@@ -196,7 +196,7 @@ static esp_err_t scd41_read(uint16_t *co2_ppm, float *temp_c, float *rh_pct)
     return ret;
 
   *co2_ppm = words[0];
-  *temp_c = -45.0f + 175.0f * (float)words[1] / 65535.0f;
+  *temp_c = -45.0f + 175.0f * (float)words[1] / 65535.0f - 1.0f;
   *rh_pct = 100.0f * (float)words[2] / 65535.0f;
   return ESP_OK;
 }
