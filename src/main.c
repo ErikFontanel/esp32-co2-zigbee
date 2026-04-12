@@ -13,6 +13,7 @@
 #include "esp_check.h"
 #include "nvs_flash.h"
 #include "esp_zigbee_core.h"
+#include "esp_ota_ops.h"
 
 // ---------------------------------------------------------------
 // Tags
@@ -46,6 +47,14 @@ static const char *TAG = "CO2_ZB";
 #define CO2_ATTR_MAX 0x0002
 
 #define MEASURE_INTERVAL_MS 10000
+#define TEMP_OFFSET_C       -1.0f  // calibration offset vs. reference sensors
+
+// OTA configuration
+#define OTA_UPGRADE_FILE_VERSION    0x00000001
+#define OTA_UPGRADE_MANUFACTURER    0x1001
+#define OTA_UPGRADE_IMAGE_TYPE      0x1011
+#define OTA_UPGRADE_HW_VERSION      0x0001
+#define OTA_UPGRADE_MAX_DATA_SIZE   223
 
 // ---------------------------------------------------------------
 // Global sensor state
@@ -196,7 +205,7 @@ static esp_err_t scd41_read(uint16_t *co2_ppm, float *temp_c, float *rh_pct)
     return ret;
 
   *co2_ppm = words[0];
-  *temp_c = -45.0f + 175.0f * (float)words[1] / 65535.0f - 1.0f;
+  *temp_c = -45.0f + 175.0f * (float)words[1] / 65535.0f + TEMP_OFFSET_C;
   *rh_pct = 100.0f * (float)words[2] / 65535.0f;
   return ESP_OK;
 }
@@ -272,11 +281,56 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 }
 
 // ---------------------------------------------------------------
+// OTA upgrade status handler
+// ---------------------------------------------------------------
+static esp_err_t zb_ota_upgrade_status_handler(esp_zb_zcl_ota_upgrade_value_message_t message)
+{
+  static uint32_t total_size = 0;
+  static uint32_t offset = 0;
+
+  if (message.info.status == ESP_ZB_ZCL_STATUS_SUCCESS) {
+    switch (message.upgrade_status) {
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START:
+      ESP_LOGI(TAG, "OTA upgrade start");
+      total_size = message.ota_header.image_size;
+      offset = 0;
+      break;
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE:
+      offset += message.payload_size;
+      ESP_LOGI(TAG, "OTA progress: %lu/%lu bytes (%lu%%)",
+               offset, total_size, total_size ? (offset * 100) / total_size : 0);
+      break;
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY:
+      ESP_LOGI(TAG, "OTA applying upgrade");
+      break;
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_CHECK:
+      return (offset == total_size) ? ESP_OK : ESP_FAIL;
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_FINISH:
+      ESP_LOGI(TAG, "OTA finished, rebooting");
+      esp_restart();
+      break;
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ABORT:
+      ESP_LOGW(TAG, "OTA aborted");
+      break;
+    default:
+      break;
+    }
+  }
+  return ESP_OK;
+}
+
+// ---------------------------------------------------------------
 // Zigbee action handler
 // ---------------------------------------------------------------
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
 {
-  ESP_LOGI(TAG, "Action callback: 0x%x", callback_id);
+  switch (callback_id) {
+  case ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID:
+    return zb_ota_upgrade_status_handler(*(esp_zb_zcl_ota_upgrade_value_message_t *)message);
+  default:
+    ESP_LOGI(TAG, "Action callback: 0x%x", callback_id);
+    break;
+  }
   return ESP_OK;
 }
 
@@ -402,6 +456,27 @@ static void esp_zb_task(void *arg)
   };
   esp_zb_attribute_list_t *co2_cluster = esp_zb_carbon_dioxide_measurement_cluster_create(&co2_cfg);
 
+  // --- OTA cluster (client role) ---
+  esp_zb_ota_cluster_cfg_t ota_cfg = {
+      .ota_upgrade_file_version = OTA_UPGRADE_FILE_VERSION,
+      .ota_upgrade_downloaded_file_ver = ESP_ZB_ZCL_OTA_UPGRADE_DOWNLOADED_FILE_VERSION_DEF_VALUE,
+      .ota_upgrade_manufacturer = OTA_UPGRADE_MANUFACTURER,
+      .ota_upgrade_image_type = OTA_UPGRADE_IMAGE_TYPE,
+  };
+  esp_zb_attribute_list_t *ota_cluster = esp_zb_ota_cluster_create(&ota_cfg);
+
+  esp_zb_zcl_ota_upgrade_client_variable_t ota_client_var = {
+      .timer_query = ESP_ZB_ZCL_OTA_UPGRADE_QUERY_TIMER_COUNT_DEF,
+      .hw_version = OTA_UPGRADE_HW_VERSION,
+      .max_data_size = OTA_UPGRADE_MAX_DATA_SIZE,
+  };
+  uint16_t ota_server_addr = ESP_ZB_ZCL_OTA_UPGRADE_SERVER_ADDR_DEF_VALUE;
+  uint8_t ota_server_ep = ESP_ZB_ZCL_OTA_UPGRADE_SERVER_ENDPOINT_DEF_VALUE;
+
+  esp_zb_ota_cluster_add_attr(ota_cluster, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_CLIENT_DATA_ID, (void *)&ota_client_var);
+  esp_zb_ota_cluster_add_attr(ota_cluster, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_SERVER_ADDR_ID, (void *)&ota_server_addr);
+  esp_zb_ota_cluster_add_attr(ota_cluster, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_SERVER_ENDPOINT_ID, (void *)&ota_server_ep);
+
   // --- Build cluster list ---
   esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
   esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
@@ -409,6 +484,7 @@ static void esp_zb_task(void *arg)
   esp_zb_cluster_list_add_temperature_meas_cluster(cluster_list, temp_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   esp_zb_cluster_list_add_humidity_meas_cluster(cluster_list, hum_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   esp_zb_cluster_list_add_carbon_dioxide_measurement_cluster(cluster_list, co2_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+  esp_zb_cluster_list_add_ota_cluster(cluster_list, ota_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
   // --- Build endpoint ---
   esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
