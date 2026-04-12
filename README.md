@@ -17,6 +17,8 @@ A Zigbee CO2, temperature, and humidity sensor using an ESP32-C6 and Sensirion S
 | GND   | GND               |
 
 > Adjust `SCD41_SDA_PIN` and `SCD41_SCL_PIN` in `src/main.c` if using a different board or pinout.
+>
+> Adjust `TEMP_OFFSET_C` in `src/main.c` to calibrate the temperature reading against a reference sensor (default: `-1.0`).
 
 ## Zigbee Clusters
 
