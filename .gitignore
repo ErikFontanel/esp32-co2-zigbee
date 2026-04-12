@@ -8,4 +8,3 @@ sdkconfig.*.old
 .vscode/launch.json
 .vscode/ipch
 .cache
-/.gtm/
