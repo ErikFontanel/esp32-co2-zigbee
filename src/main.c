@@ -15,6 +15,7 @@
 #include "esp_zigbee_core.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
+#include "led_strip.h"
 
 // ---------------------------------------------------------------
 // Tags
@@ -26,9 +27,21 @@ static const char *TAG = "CO2_ZB";
 // ---------------------------------------------------------------
 #define SCD41_SDA_PIN 4
 #define SCD41_SCL_PIN 5
-#define LED_PIN       15
 #define BUTTON_PIN    9
 #define BUTTON_HOLD_MS 5000
+
+// LED config. Default: WS2812 RGB on GPIO 8 (XIAO ESP32-C6 / Super Mini variants).
+// Set LED_USE_WS2812 to 0 to fall back to a single-color GPIO LED; colors are
+// then encoded as distinct blink patterns.
+#ifndef LED_USE_WS2812
+#define LED_USE_WS2812 1
+#endif
+
+#if LED_USE_WS2812
+#define LED_PIN 8
+#else
+#define LED_PIN 15
+#endif
 #define I2C_PORT I2C_NUM_0
 #define I2C_FREQ_HZ 100000
 #define SCD41_ADDR 0x62
@@ -204,31 +217,153 @@ static esp_err_t scd41_read(uint16_t *co2_ppm, float *temp_c, float *rh_pct)
 }
 
 // ---------------------------------------------------------------
-// LED helpers (identify blink)
+// LED helpers — RGB state machine
+//
+// On a WS2812 we render colors directly. On a single-color GPIO LED we ignore
+// the color and rely on the pattern (blink count + cadence) to disambiguate
+// states. The state semantics:
+//
+//   OFF            steady off (idle, normal operation)
+//   RESET_CONFIRM  three quick red blinks (boot button held past threshold)
+//   PAIRING        rapid yellow flashing (network steering in progress / retry)
+//   PAIRED_OK      three slow green blinks, then back to OFF
+//   IDENTIFY       slow blue blinking while the coordinator's Identify is on
 // ---------------------------------------------------------------
-static volatile bool identify_active = false;
+typedef enum {
+  LED_STATE_OFF = 0,
+  LED_STATE_RESET_CONFIRM,
+  LED_STATE_PAIRING,
+  LED_STATE_PAIRED_OK,
+  LED_STATE_IDENTIFY,
+} led_state_t;
+
+static volatile led_state_t led_state = LED_STATE_OFF;
+
+#if LED_USE_WS2812
+static led_strip_handle_t led_strip = NULL;
+#endif
 
 static void led_init(void)
 {
+#if LED_USE_WS2812
+  led_strip_config_t strip_cfg = {
+      .strip_gpio_num = LED_PIN,
+      .max_leds = 1,
+      .led_model = LED_MODEL_WS2812,
+      .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+  };
+  led_strip_rmt_config_t rmt_cfg = {
+      .clk_src = RMT_CLK_SRC_DEFAULT,
+      .resolution_hz = 10 * 1000 * 1000, // 10 MHz
+      .flags.with_dma = false,
+  };
+  ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &led_strip));
+  led_strip_clear(led_strip);
+#else
   gpio_config_t io = {
       .pin_bit_mask = 1ULL << LED_PIN,
       .mode = GPIO_MODE_OUTPUT,
   };
   gpio_config(&io);
   gpio_set_level(LED_PIN, 0);
+#endif
+}
+
+// Render a single color. On WS2812: literal RGB. On a plain LED: any non-zero
+// component lights it up; (0,0,0) turns it off.
+static void led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+#if LED_USE_WS2812
+  if (!led_strip) return;
+  led_strip_set_pixel(led_strip, 0, r, g, b);
+  led_strip_refresh(led_strip);
+#else
+  gpio_set_level(LED_PIN, (r | g | b) ? 1 : 0);
+#endif
+}
+
+// Sleep that aborts early if the LED state changes — keeps blink sequences
+// from blocking a higher-priority state transition (e.g. PAIRING starting
+// while a PAIRED_OK is still finishing).
+static bool led_sleep(uint32_t ms, led_state_t expect)
+{
+  uint32_t step = 20;
+  while (ms > 0) {
+    uint32_t chunk = ms < step ? ms : step;
+    vTaskDelay(pdMS_TO_TICKS(chunk));
+    ms -= chunk;
+    if (led_state != expect) return false;
+  }
+  return true;
+}
+
+static void led_blink_n(uint8_t r, uint8_t g, uint8_t b,
+                        int count, uint32_t on_ms, uint32_t off_ms,
+                        led_state_t expect)
+{
+  for (int i = 0; i < count; i++) {
+    led_set_rgb(r, g, b);
+    if (!led_sleep(on_ms, expect)) return;
+    led_set_rgb(0, 0, 0);
+    if (!led_sleep(off_ms, expect)) return;
+  }
 }
 
 static void led_task(void *arg)
 {
-  bool on = false;
   while (1) {
-    if (identify_active) {
-      on = !on;
-      gpio_set_level(LED_PIN, on);
-      vTaskDelay(pdMS_TO_TICKS(250));
-    } else {
-      if (on) { gpio_set_level(LED_PIN, 0); on = false; }
+    led_state_t s = led_state;
+    switch (s) {
+    case LED_STATE_OFF:
+      led_set_rgb(0, 0, 0);
       vTaskDelay(pdMS_TO_TICKS(100));
+      break;
+
+    case LED_STATE_RESET_CONFIRM:
+      led_blink_n(255, 0, 0, 3, 150, 150, s);
+      // Hand off to whatever state was scheduled next (pairing kicks in after
+      // the device reboots into factory-new). If nothing else changed, idle.
+      if (led_state == s) led_state = LED_STATE_OFF;
+      break;
+
+    case LED_STATE_PAIRING:
+      // Rapid yellow flashing — keeps going until state changes.
+      led_set_rgb(255, 90, 0);
+      if (!led_sleep(80, s)) break;
+      led_set_rgb(0, 0, 0);
+      led_sleep(80, s);
+      break;
+
+    case LED_STATE_PAIRED_OK:
+#if LED_USE_WS2812
+      // Three green "breaths" — ramp brightness up then down.
+      for (int i = 0; i < 3 && led_state == s; i++) {
+        const int steps = 32;
+        const uint32_t step_ms = 25; // 32 * 25 * 2 = 1.6s per breath
+        for (int k = 0; k <= steps && led_state == s; k++) {
+          uint8_t g = (uint8_t)((k * 255) / steps);
+          led_set_rgb(0, g, 0);
+          if (!led_sleep(step_ms, s)) break;
+        }
+        for (int k = steps; k >= 0 && led_state == s; k--) {
+          uint8_t g = (uint8_t)((k * 255) / steps);
+          led_set_rgb(0, g, 0);
+          if (!led_sleep(step_ms, s)) break;
+        }
+      }
+#else
+      // Single-LED fallback: still binary, just slow blinks.
+      led_blink_n(0, 255, 0, 3, 600, 400, s);
+#endif
+      if (led_state == s) led_state = LED_STATE_OFF;
+      break;
+
+    case LED_STATE_IDENTIFY:
+      led_set_rgb(255, 255, 255);
+      if (!led_sleep(250, s)) break;
+      led_set_rgb(0, 0, 0);
+      led_sleep(250, s);
+      break;
     }
   }
 }
@@ -251,7 +386,9 @@ static void button_task(void *arg)
       held_ms += 100;
       if (held_ms >= BUTTON_HOLD_MS) {
         ESP_LOGW(TAG, "Button held %u ms -> factory reset", (unsigned)held_ms);
-        gpio_set_level(LED_PIN, 1);
+        // Play 3x red blink confirmation, then trigger reset (which reboots).
+        led_state = LED_STATE_RESET_CONFIRM;
+        vTaskDelay(pdMS_TO_TICKS(3 * (150 + 150) + 100));
         esp_zb_factory_reset();
       }
     } else {
@@ -293,16 +430,20 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                esp_zb_bdb_is_factory_new() ? "factory new" : "provisioned");
       if (esp_zb_bdb_is_factory_new())
       {
+        led_state = LED_STATE_PAIRING;
         esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
       }
       else
       {
+        // Already paired — silent boot.
+        led_state = LED_STATE_OFF;
         zb_connected = true;
       }
     }
     else
     {
       ESP_LOGW(TAG, "Zigbee BDB init failed: %s, retrying steering...", esp_err_to_name(err));
+      led_state = LED_STATE_PAIRING;
       esp_zb_scheduler_alarm(
           bdb_start_top_level_commissioning_cb,
           ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
@@ -315,10 +456,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
       ESP_LOGI(TAG, "Joined network (ch:%d addr:0x%04hx)",
                esp_zb_get_current_channel(), esp_zb_get_short_address());
       zb_connected = true;
+      led_state = LED_STATE_PAIRED_OK;
     }
     else
     {
       ESP_LOGW(TAG, "Zigbee steering failed: %s, retry in 1s", esp_err_to_name(err));
+      led_state = LED_STATE_PAIRING;
       esp_zb_scheduler_alarm(
           bdb_start_top_level_commissioning_cb,
           ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
@@ -381,8 +524,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
   case ESP_ZB_CORE_IDENTIFY_EFFECT_CB_ID: {
     esp_zb_zcl_identify_effect_message_t *m = (esp_zb_zcl_identify_effect_message_t *)message;
     ESP_LOGI(TAG, "Identify effect id=0x%x", m->effect_id);
-    identify_active = (m->effect_id != ESP_ZB_ZCL_IDENTIFY_EFFECT_ID_FINISH_EFFECT &&
-                       m->effect_id != ESP_ZB_ZCL_IDENTIFY_EFFECT_ID_STOP);
+    bool active = (m->effect_id != ESP_ZB_ZCL_IDENTIFY_EFFECT_ID_FINISH_EFFECT &&
+                   m->effect_id != ESP_ZB_ZCL_IDENTIFY_EFFECT_ID_STOP);
+    led_state = active ? LED_STATE_IDENTIFY : LED_STATE_OFF;
     return ESP_OK;
   }
   case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID: {
@@ -390,8 +534,8 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY &&
         m->attribute.id == ESP_ZB_ZCL_ATTR_IDENTIFY_IDENTIFY_TIME_ID) {
       uint16_t t = *(uint16_t *)m->attribute.data.value;
-      identify_active = (t > 0);
       ESP_LOGI(TAG, "IdentifyTime=%u", t);
+      led_state = (t > 0) ? LED_STATE_IDENTIFY : LED_STATE_OFF;
     }
     return ESP_OK;
   }

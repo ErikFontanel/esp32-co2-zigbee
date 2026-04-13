@@ -61,12 +61,26 @@ The device shows up as `SCD41-XIAO` with CO2 (ppm), temperature (C), and humidit
 
 ## Factory Reset
 
-To re-pair the device, erase the flash and re-upload:
+Hold the BOOT button (GPIO 9) for 5 seconds. The device confirms the reset, reboots, and re-pairs automatically.
+
+Alternatively, erase the flash and re-upload:
 
 ```bash
 pio run -t erase
 pio run -t upload
 ```
+
+## LED Status
+
+Drives a WS2812 on GPIO 8 (set `LED_USE_WS2812=0` in `src/main.c` to fall back to a single-color LED on GPIO 15 with equivalent blink patterns).
+
+| State | LED |
+|---|---|
+| Idle / paired | off |
+| Reset confirmed | 3× red flash |
+| Pairing | rapid yellow flashing |
+| Paired | 3× green breathing, then off |
+| Identify (from coordinator) | slow white blink |
 
 ## Project Structure
 

@@ -3,3 +3,5 @@ dependencies:
     version: "*"
   espressif/esp-zboss-lib:
     version: "*"
+  espressif/led_strip:
+    version: "^3"
