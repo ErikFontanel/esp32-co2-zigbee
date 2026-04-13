@@ -92,7 +92,7 @@ The device has a Zigbee OTA client. To push a new firmware image:
    pio run -e esp32c6-zigbee
    python scripts/build_ota.py
    ```
-3. Drop the resulting `build/ota/scd41-xiao-*.ota` into your Zigbee2MQTT OTA directory (e.g. `/config/zigbee2mqtt/ota/`) and trigger an update from the device's OTA panel in Z2M.
+3. Upload the resulting `build/ota/scd41-xiao-*.ota` directly through the device's OTA panel in the Zigbee2MQTT web UI.
 
 The device verifies the image, applies it, and reboots automatically. Progress is logged over serial.
 
