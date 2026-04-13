@@ -82,6 +82,20 @@ Drives a WS2812 on GPIO 8 (set `LED_USE_WS2812=0` in `src/main.c` to fall back t
 | Paired | 3× green breathing, then off |
 | Identify (from coordinator) | slow white blink |
 
+## OTA Updates
+
+The device has a Zigbee OTA client. To push a new firmware image:
+
+1. Bump `OTA_UPGRADE_FILE_VERSION` in `src/main.c`.
+2. Build firmware and OTA image:
+   ```bash
+   pio run -e esp32c6-zigbee
+   python scripts/build_ota.py
+   ```
+3. Drop the resulting `build/ota/scd41-xiao-*.ota` into your Zigbee2MQTT OTA directory (e.g. `/config/zigbee2mqtt/ota/`) and trigger an update from the device's OTA panel in Z2M.
+
+The device verifies the image, applies it, and reboots automatically. Progress is logged over serial.
+
 ## Project Structure
 
 ```
