@@ -16,6 +16,7 @@
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
 #include "led_strip.h"
+#include "display.h"
 
 // ---------------------------------------------------------------
 // Tags
@@ -592,6 +593,8 @@ static void sensor_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(5000));
   }
 
+  display_init(i2c_bus);
+
   while (1)
   {
     uint16_t co2_ppm;
@@ -601,6 +604,8 @@ static void sensor_task(void *arg)
     {
       ESP_LOGI(TAG, "CO2: %u ppm  T: %.1f C  RH: %.1f %%",
                co2_ppm, temp_c, rh_pct);
+
+      display_update(co2_ppm, temp_c, rh_pct);
 
       if (zb_connected)
       {
