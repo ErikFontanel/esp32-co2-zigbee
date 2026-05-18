@@ -54,6 +54,7 @@ static const char *TAG = "CO2_ZB";
 #define SCD41_READ_MEASUREMENT 0xEC05
 #define SCD41_GET_DATA_READY 0xE4B8
 #define SCD41_GET_SERIAL 0x3682
+#define SCD41_SET_TEMP_OFFSET 0x241D
 
 // ---------------------------------------------------------------
 // Zigbee Configuration
@@ -65,7 +66,9 @@ static const char *TAG = "CO2_ZB";
 #define CO2_ATTR_MAX 0x0002
 
 #define MEASURE_INTERVAL_MS 10000
-#define TEMP_OFFSET_C       -1.0f  // calibration offset vs. reference sensors
+#ifndef TEMP_OFFSET_C
+#define TEMP_OFFSET_C       0.0f
+#endif
 
 // OTA configuration
 #define OTA_UPGRADE_FILE_VERSION    0x00000001
@@ -74,10 +77,17 @@ static const char *TAG = "CO2_ZB";
 #define OTA_UPGRADE_HW_VERSION      0x0001
 #define OTA_UPGRADE_MAX_DATA_SIZE   223
 
+// CO2 LED enable/disable default (overridable per-device via build flag)
+#ifndef CO2_LED_DEFAULT
+#define CO2_LED_DEFAULT 1
+#endif
+
 // ---------------------------------------------------------------
 // Global sensor state
 // ---------------------------------------------------------------
 static volatile bool zb_connected = false;
+static volatile uint16_t last_co2_ppm = 0;
+static volatile bool co2_led_enabled = CO2_LED_DEFAULT;
 
 // CO2 attribute storage (must be static for Zigbee references)
 static float co2_val = 0.0f;
@@ -135,6 +145,13 @@ static esp_err_t scd41_send_cmd(uint16_t cmd)
   return i2c_master_transmit(scd41_dev, buf, 2, I2C_TIMEOUT_MS);
 }
 
+static esp_err_t scd41_write_word(uint16_t cmd, uint16_t word)
+{
+  uint8_t data[2] = {word >> 8, word & 0xFF};
+  uint8_t buf[5] = {cmd >> 8, cmd & 0xFF, data[0], data[1], scd41_crc(data, 2)};
+  return i2c_master_transmit(scd41_dev, buf, 5, I2C_TIMEOUT_MS);
+}
+
 static esp_err_t scd41_read_words(uint16_t cmd, uint16_t *words, size_t count, uint32_t delay_ms)
 {
   uint8_t cmd_buf[2] = {cmd >> 8, cmd & 0xFF};
@@ -187,6 +204,21 @@ static esp_err_t scd41_init(void)
     ESP_LOGE(TAG, "get_serial: %s", esp_err_to_name(ret));
   }
 
+  // Read current temperature offset, then set ours
+  uint16_t cur_offset_word;
+  ret = scd41_read_words(0x2318, &cur_offset_word, 1, 1);
+  if (ret == ESP_OK) {
+    float cur_offset = cur_offset_word * 175.0f / 65535.0f;
+    ESP_LOGI(TAG, "SCD41 current temp_offset: %.2f C", (double)cur_offset);
+  }
+
+  if (TEMP_OFFSET_C != 0.0f) {
+    uint16_t offset_word = (uint16_t)(TEMP_OFFSET_C * 65535.0f / 175.0f);
+    ret = scd41_write_word(SCD41_SET_TEMP_OFFSET, offset_word);
+    ESP_LOGI(TAG, "set_temp_offset(%.1f C): %s", (double)TEMP_OFFSET_C, esp_err_to_name(ret));
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
   // Start periodic measurement
   ret = scd41_send_cmd(SCD41_START_PERIODIC);
   ESP_LOGI(TAG, "start_periodic: %s", esp_err_to_name(ret));
@@ -212,7 +244,7 @@ static esp_err_t scd41_read(uint16_t *co2_ppm, float *temp_c, float *rh_pct)
     return ret;
 
   *co2_ppm = words[0];
-  *temp_c = -45.0f + 175.0f * (float)words[1] / 65535.0f + TEMP_OFFSET_C;
+  *temp_c = -45.0f + 175.0f * (float)words[1] / 65535.0f;
   *rh_pct = 100.0f * (float)words[2] / 65535.0f;
   return ESP_OK;
 }
@@ -316,7 +348,16 @@ static void led_task(void *arg)
     led_state_t s = led_state;
     switch (s) {
     case LED_STATE_OFF:
-      led_set_rgb(0, 0, 0);
+      if (co2_led_enabled && last_co2_ppm >= 800) {
+        if (last_co2_ppm >= 5000)
+          led_set_rgb(255, 0, 0);
+        else if (last_co2_ppm >= 2000)
+          led_set_rgb(255, 60, 0);
+        else
+          led_set_rgb(255, 180, 0);
+      } else {
+        led_set_rgb(0, 0, 0);
+      }
       vTaskDelay(pdMS_TO_TICKS(100));
       break;
 
@@ -538,6 +579,11 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
       ESP_LOGI(TAG, "IdentifyTime=%u", t);
       led_state = (t > 0) ? LED_STATE_IDENTIFY : LED_STATE_OFF;
     }
+    if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
+        m->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
+      co2_led_enabled = *(bool *)m->attribute.data.value;
+      ESP_LOGI(TAG, "CO2 LED %s", co2_led_enabled ? "enabled" : "disabled");
+    }
     return ESP_OK;
   }
   default:
@@ -605,6 +651,7 @@ static void sensor_task(void *arg)
       ESP_LOGI(TAG, "CO2: %u ppm  T: %.1f C  RH: %.1f %%",
                co2_ppm, temp_c, rh_pct);
 
+      last_co2_ppm = co2_ppm;
       display_update(co2_ppm, temp_c, rh_pct);
 
       if (zb_connected)
@@ -676,6 +723,10 @@ static void esp_zb_task(void *arg)
   esp_zb_identify_cluster_cfg_t identify_cfg = {.identify_time = 0};
   esp_zb_attribute_list_t *identify_cluster = esp_zb_identify_cluster_create(&identify_cfg);
 
+  // --- On/Off cluster (controls CO2 LED indicator) ---
+  esp_zb_on_off_cluster_cfg_t onoff_cfg = {.on_off = co2_led_enabled};
+  esp_zb_attribute_list_t *onoff_cluster = esp_zb_on_off_cluster_create(&onoff_cfg);
+
   // --- Temperature cluster ---
   esp_zb_temperature_meas_cluster_cfg_t temp_cfg = {
       .measured_value = 2200, // 22.00 C initial
@@ -725,6 +776,7 @@ static void esp_zb_task(void *arg)
   esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
   esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   esp_zb_cluster_list_add_identify_cluster(cluster_list, identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+  esp_zb_cluster_list_add_on_off_cluster(cluster_list, onoff_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   esp_zb_cluster_list_add_temperature_meas_cluster(cluster_list, temp_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   esp_zb_cluster_list_add_humidity_meas_cluster(cluster_list, hum_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   esp_zb_cluster_list_add_carbon_dioxide_measurement_cluster(cluster_list, co2_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
