@@ -477,7 +477,11 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
       }
       else
       {
-        // Already paired — silent boot.
+        // Already paired — silent boot, but log net info for diagnosis.
+        ESP_LOGI(TAG, "Rejoined network (ch:%d addr:0x%04hx pan:0x%04hx)",
+                 esp_zb_get_current_channel(),
+                 esp_zb_get_short_address(),
+                 esp_zb_get_pan_id());
         led_state = LED_STATE_OFF;
         zb_connected = true;
       }
