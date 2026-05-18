@@ -18,7 +18,11 @@ A Zigbee CO2, temperature, and humidity sensor using an ESP32-C6 and Sensirion S
 
 > Adjust `SCD41_SDA_PIN` and `SCD41_SCL_PIN` in `src/main.c` if using a different board or pinout.
 >
-> Adjust `TEMP_OFFSET_C` in `src/main.c` to calibrate the temperature reading against a reference sensor (default: `-1.0`).
+> Adjust `TEMP_OFFSET_C` via the PlatformIO `build_flags` in `platformio.ini` to calibrate the temperature reading against a reference sensor (default: `-1.0`).
+
+### Optional: OLED Display
+
+An SSD1306 128×32 I2C OLED can be connected to the same I2C bus (address `0x3C`). It is runtime-detected — if absent, the firmware runs normally without it. When present, it shows CO2, temperature, and humidity readings.
 
 ## Zigbee Clusters
 
@@ -27,6 +31,7 @@ A Zigbee CO2, temperature, and humidity sensor using an ESP32-C6 and Sensirion S
 | Temperature Measurement | 0x0402 | int16, 0.01 C units |
 | Relative Humidity | 0x0405 | uint16, 0.01% units |
 | Carbon Dioxide Measurement | 0x040D | float, fraction (ppm / 1,000,000) |
+| On/Off | 0x0006 | bool — controls the CO2 level indicator LED |
 
 ## Building & Flashing
 
@@ -76,11 +81,16 @@ Drives a WS2812 on GPIO 8 (set `LED_USE_WS2812=0` in `src/main.c` to fall back t
 
 | State | LED |
 |---|---|
-| Idle / paired | off |
+| Idle, CO2 < 800 ppm | off |
+| Idle, CO2 800–1999 ppm | steady yellow |
+| Idle, CO2 2000–4999 ppm | steady orange |
+| Idle, CO2 ≥ 5000 ppm | steady red |
 | Reset confirmed | 3× red flash |
 | Pairing | rapid yellow flashing |
 | Paired | 3× green breathing, then off |
 | Identify (from coordinator) | slow white blink |
+
+The CO2 indicator can be toggled on/off via Zigbee (On/Off cluster), which shows up as a "CO2 LED" switch in Zigbee2MQTT. Set the default per device with the `CO2_LED_DEFAULT` build flag in `platformio.ini` (1 = on, 0 = off).
 
 ## OTA Updates
 
@@ -89,7 +99,7 @@ The device has a Zigbee OTA client. To push a new firmware image:
 1. Bump `OTA_UPGRADE_FILE_VERSION` in `src/main.c`.
 2. Build firmware and OTA image:
    ```bash
-   pio run -e esp32c6-zigbee
+   pio run -e esp32c6-zigbee-office
    python scripts/build_ota.py
    ```
 3. Upload the resulting `build/ota/scd41-xiao-*.ota` directly through the device's OTA panel in the Zigbee2MQTT web UI.
