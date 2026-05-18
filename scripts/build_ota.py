@@ -5,7 +5,8 @@ Reads OTA_UPGRADE_* defines from src/main.c so the OTA header always
 matches the running firmware. Output goes to build/ota/<name>.ota.
 
 Usage:
-    python scripts/build_ota.py
+    python scripts/build_ota.py <env>
+    # e.g. python scripts/build_ota.py esp32c6-zigbee-bedroom
 """
 
 import re
@@ -14,7 +15,6 @@ import sys
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-FIRMWARE_BIN = PROJECT_DIR / ".pio/build/esp32c6-zigbee/firmware.bin"
 MAIN_C = PROJECT_DIR / "src/main.c"
 OUTPUT_DIR = PROJECT_DIR / "build/ota"
 
@@ -71,9 +71,16 @@ def build_ota_header(defines: dict[str, int], image_size: int) -> bytes:
 
 
 def main():
-    if not FIRMWARE_BIN.exists():
-        print(f"Error: firmware not found at {FIRMWARE_BIN}")
-        print("Run 'pio run -e esp32c6-zigbee' first.")
+    if len(sys.argv) != 2:
+        print("Usage: python scripts/build_ota.py <env>")
+        print("  e.g. python scripts/build_ota.py esp32c6-zigbee-bedroom")
+        sys.exit(1)
+
+    env = sys.argv[1]
+    firmware_bin = PROJECT_DIR / f".pio/build/{env}/firmware.bin"
+    if not firmware_bin.exists():
+        print(f"Error: firmware not found at {firmware_bin}")
+        print(f"Run '~/.platformio/penv/bin/pio run -e {env}' first.")
         sys.exit(1)
 
     defines = parse_defines(MAIN_C)
@@ -83,17 +90,18 @@ def main():
             print(f"Error: {key} not found in {MAIN_C}")
             sys.exit(1)
 
-    firmware = FIRMWARE_BIN.read_bytes()
+    firmware = firmware_bin.read_bytes()
     header = build_ota_header(defines, len(firmware))
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     version = defines["OTA_UPGRADE_FILE_VERSION"]
-    output_name = f"scd41-xiao-{version:#010x}.ota"
+    output_name = f"scd41-xiao-{env}-{version:#010x}.ota"
     output_path = OUTPUT_DIR / output_name
 
     output_path.write_bytes(header + firmware)
 
     print(f"OTA image: {output_path}")
+    print(f"  Env:          {env}")
     print(f"  Manufacturer: {defines['OTA_UPGRADE_MANUFACTURER']:#06x}")
     print(f"  Image type:   {defines['OTA_UPGRADE_IMAGE_TYPE']:#06x}")
     print(f"  File version: {version:#010x}")
