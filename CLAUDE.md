@@ -17,6 +17,25 @@ reporting it as done. Don't rely on the user to confirm. For this project that m
   ESP32-C6 boot panics). Capture ~20s to see a full boot cycle, then confirm
   the error is gone.
 
+## Bumping firmware version
+
+Single source of truth lives in two places that MUST be edited together:
+
+1. `CMakeLists.txt`: `set(PROJECT_VER "X.Y.Z")` — drives `esp_app_desc_t::version`,
+   shown as **Firmware ID** in Z2M (via Basic cluster `SW_BUILD_ID`).
+2. `src/main.c`: `OTA_UPGRADE_FILE_VERSION` — uint32 encoded as `0xMMmmppbb`
+   (major.minor.patch.build, 8 bits each). Read by Z2M as the device's
+   **Firmware version** (OTA cluster `currentFileVersion`) and used to
+   decide whether an `.ota` file is "newer".
+
+Example: `1.0.1` → `0x01000100`, `1.2.3` → `0x01020300`.
+
+After bumping:
+- Build both envs: `~/.platformio/penv/bin/pio run -e esp32c6-zigbee-bedroom -e esp32c6-zigbee-office`
+- Build the OTA image: `python scripts/build_ota.py` → `build/ota/scd41-xiao-0xMMmmppbb.ota`
+  (the script parses `OTA_UPGRADE_FILE_VERSION` straight from `src/main.c`).
+- Flash directly via USB (`-t upload`) or push via Z2M OTA (see below).
+
 ## sdkconfig layout
 
 - `sdkconfig.defaults` — seed values for a fresh sdkconfig generation.

@@ -71,7 +71,9 @@ static const char *TAG = "CO2_ZB";
 #endif
 
 // OTA configuration
-#define OTA_UPGRADE_FILE_VERSION    0x00000001
+// OTA_UPGRADE_FILE_VERSION encodes semver as 0xMMmmppbb (major.minor.patch.build).
+// Keep in sync with PROJECT_VER in CMakeLists.txt.
+#define OTA_UPGRADE_FILE_VERSION    0x01000000
 #define OTA_UPGRADE_MANUFACTURER    0x1001
 #define OTA_UPGRADE_IMAGE_TYPE      0x1011
 #define OTA_UPGRADE_HW_VERSION      0x0001
