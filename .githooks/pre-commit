@@ -1,0 +1,22 @@
+#!/bin/sh
+# Pre-commit hook: lint+format staged JS/JSON files with Biome.
+# Activated per clone via `npm run install-hooks` (sets core.hooksPath).
+
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(js|mjs|cjs|ts|json|jsonc)$' || true)
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+if ! command -v npx >/dev/null 2>&1; then
+    echo "pre-commit: npx not found — install Node.js or skip with 'git commit --no-verify'" >&2
+    exit 1
+fi
+
+if [ ! -d node_modules ]; then
+    echo "pre-commit: installing Biome (first run)..." >&2
+    npm install --no-audit --no-fund --silent
+fi
+
+echo "$staged" | xargs npx --no-install @biomejs/biome check --no-errors-on-unmatched --files-ignore-unknown=true

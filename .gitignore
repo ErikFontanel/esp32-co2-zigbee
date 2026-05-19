@@ -12,3 +12,4 @@ sdkconfig.*.old
 build/
 .claude/settings.local.json
 compile_commands.json
+node_modules/

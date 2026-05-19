@@ -117,6 +117,27 @@ sdkconfig.defaults          # Zigbee + flash config
 platformio.ini              # PlatformIO build config
 ```
 
+## Development
+
+Firmware lives in C (`src/`) and is built with PlatformIO — see [Building & Flashing](#building--flashing).
+
+Non-firmware files (the Z2M converter, helper scripts) are linted and formatted with [Biome](https://biomejs.dev/). On first clone:
+
+```bash
+npm install            # installs Biome
+npm run install-hooks  # points git at .githooks/ for the pre-commit check
+```
+
+After that, every commit runs `biome check` on staged JS/JSON files. Manual commands:
+
+```bash
+npm run lint       # check formatting + lint
+npm run lint:fix   # auto-fix where possible
+npm run format     # format only
+```
+
+Bypass once with `git commit --no-verify`.
+
 ## Disclaimer
 
 This project was built using intuitive engineering (some people call it "vibe coding") with [Claude Code](https://claude.ai/code). The firmware works, the sensor reads, Zigbee reports -- but this has not been rigorously tested, reviewed for edge cases, or validated for production use. Use at your own risk. If your smart home burns down because of a rogue CO2 reading, that's on you.
