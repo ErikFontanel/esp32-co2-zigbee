@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_zigbee_core.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
@@ -77,7 +78,7 @@ static const char *TAG = "CO2_ZB";
 // OTA configuration
 // OTA_UPGRADE_FILE_VERSION encodes semver as 0xMMmmppbb (major.minor.patch.build).
 // Keep in sync with PROJECT_VER in CMakeLists.txt.
-#define OTA_UPGRADE_FILE_VERSION    0x01010000
+#define OTA_UPGRADE_FILE_VERSION    0x01020000
 #define OTA_UPGRADE_MANUFACTURER    0x1001
 #define OTA_UPGRADE_IMAGE_TYPE      0x1011
 #define OTA_UPGRADE_HW_VERSION      0x0001
@@ -88,6 +89,15 @@ static const char *TAG = "CO2_ZB";
 #define CO2_LED_DEFAULT 1
 #endif
 
+// Temperature calibration offset — runtime-tunable, persisted in NVS.
+// Custom manufacturer attribute on the Temperature Measurement cluster, exposed
+// to Z2M as `temperature_offset` (units: 0.01 °C, signed). The value is
+// subtracted from the raw sensor reading before publishing.
+#define TEMP_OFFSET_ATTR_ID         0xFF01
+#define TEMP_OFFSET_MANUF_CODE      0x1001
+#define NVS_NAMESPACE               "co2"
+#define NVS_KEY_TEMP_OFFSET         "temp_offset"
+
 // ---------------------------------------------------------------
 // Global sensor state
 // ---------------------------------------------------------------
@@ -97,10 +107,48 @@ static volatile bool co2_led_enabled = CO2_LED_DEFAULT;
 static volatile bool display_power = true;
 static volatile uint8_t display_brightness = DISPLAY_BRIGHTNESS_DEFAULT;
 
+// Runtime temperature offset (0.01 °C units, signed). Loaded from NVS at boot,
+// falls back to TEMP_OFFSET_C build flag * 100. Applied as
+// `published_temp = raw_temp - temp_offset_raw / 100` so users can dial in any
+// signed correction from HA without rebuilding.
+static volatile int16_t temp_offset_raw = (int16_t)(TEMP_OFFSET_C * 100.0f);
+
 // CO2 attribute storage (must be static for Zigbee references)
 static float co2_val = 0.0f;
 static float co2_min = 0.0f;
 static float co2_max = 1.0f; // ZCL CO2 cluster uses fraction 0.0-1.0
+
+// ---------------------------------------------------------------
+// Temperature-offset persistence
+// ---------------------------------------------------------------
+static void temp_offset_load(void)
+{
+  nvs_handle_t h;
+  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+  int16_t v;
+  if (nvs_get_i16(h, NVS_KEY_TEMP_OFFSET, &v) == ESP_OK) {
+    temp_offset_raw = v;
+    ESP_LOGI(TAG, "loaded temp_offset from NVS: %.2f C", (double)v / 100.0);
+  } else {
+    // First boot — seed NVS with the build-flag default so future reverts
+    // ("set to 0") behave the same as fresh user input rather than re-reading
+    // the build flag.
+    nvs_set_i16(h, NVS_KEY_TEMP_OFFSET, temp_offset_raw);
+    nvs_commit(h);
+    ESP_LOGI(TAG, "seeded NVS temp_offset with build default: %.2f C",
+             (double)temp_offset_raw / 100.0);
+  }
+  nvs_close(h);
+}
+
+static void temp_offset_save(int16_t v)
+{
+  nvs_handle_t h;
+  if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_i16(h, NVS_KEY_TEMP_OFFSET, v);
+  nvs_commit(h);
+  nvs_close(h);
+}
 
 // ---------------------------------------------------------------
 // Sensirion CRC-8 (poly 0x31, init 0xFF)
@@ -220,12 +268,11 @@ static esp_err_t scd41_init(void)
     ESP_LOGI(TAG, "SCD41 current temp_offset: %.2f C", (double)cur_offset);
   }
 
-  if (TEMP_OFFSET_C != 0.0f) {
-    uint16_t offset_word = (uint16_t)(TEMP_OFFSET_C * 65535.0f / 175.0f);
-    ret = scd41_write_word(SCD41_SET_TEMP_OFFSET, offset_word);
-    ESP_LOGI(TAG, "set_temp_offset(%.1f C): %s", (double)TEMP_OFFSET_C, esp_err_to_name(ret));
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
+  // Force the SCD41's internal offset to zero — we apply calibration in
+  // firmware so it works for any signed value (SCD41's register is unsigned).
+  ret = scd41_write_word(SCD41_SET_TEMP_OFFSET, 0);
+  ESP_LOGI(TAG, "clear SCD41 internal offset: %s", esp_err_to_name(ret));
+  vTaskDelay(pdMS_TO_TICKS(1));
 
   // Start periodic measurement
   ret = scd41_send_cmd(SCD41_START_PERIODIC);
@@ -608,6 +655,13 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
       display_brightness = *(uint8_t *)m->attribute.data.value;
       display_set_brightness(display_brightness);
     }
+    if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT &&
+        m->attribute.id == TEMP_OFFSET_ATTR_ID) {
+      int16_t v = *(int16_t *)m->attribute.data.value;
+      temp_offset_raw = v;
+      temp_offset_save(v);
+      ESP_LOGI(TAG, "temp_offset set to %.2f C", (double)v / 100.0);
+    }
     return ESP_OK;
   }
   default:
@@ -670,6 +724,9 @@ static void sensor_task(void *arg)
 
     if (scd41_read(&co2_ppm, &temp_c, &rh_pct) == ESP_OK)
     {
+      // Apply calibration offset once, so display and Zigbee agree.
+      temp_c -= (float)temp_offset_raw / 100.0f;
+
       ESP_LOGI(TAG, "CO2: %u ppm  T: %.1f C  RH: %.1f %%",
                co2_ppm, temp_c, rh_pct);
 
@@ -756,6 +813,18 @@ static void esp_zb_task(void *arg)
       .max_value = 8500,
   };
   esp_zb_attribute_list_t *temp_cluster = esp_zb_temperature_meas_cluster_create(&temp_cfg);
+
+  // Manufacturer-specific calibration offset (0.01 °C, signed). Writable from
+  // Z2M/HA; persisted to NVS by the action handler.
+  static int16_t temp_offset_attr_val;
+  temp_offset_attr_val = temp_offset_raw;
+  esp_zb_cluster_add_manufacturer_attr(temp_cluster,
+                                       ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+                                       TEMP_OFFSET_ATTR_ID,
+                                       TEMP_OFFSET_MANUF_CODE,
+                                       ESP_ZB_ZCL_ATTR_TYPE_S16,
+                                       ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
+                                       &temp_offset_attr_val);
 
   // --- Humidity cluster ---
   esp_zb_humidity_meas_cluster_cfg_t hum_cfg = {
@@ -897,6 +966,10 @@ void app_main(void)
     ret = nvs_flash_init();
   }
   ESP_ERROR_CHECK(ret);
+
+  // Pull the temperature calibration offset from NVS before Zigbee starts so
+  // the attribute's initial value is correct on the very first report.
+  temp_offset_load();
 
   // Probe for the OLED before Zigbee starts so esp_zb_task can decide whether
   // to register the display endpoint. i2c_init() is idempotent — scd41_init()

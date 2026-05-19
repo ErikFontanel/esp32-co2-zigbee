@@ -4,6 +4,11 @@ import * as m from "zigbee-herdsman-converters/lib/modernExtend";
 const e = exposes.presets;
 const ea = exposes.access;
 
+// Manufacturer-specific attribute on the Temperature Measurement cluster
+// (firmware-side: see TEMP_OFFSET_ATTR_ID / TEMP_OFFSET_MANUF_CODE in main.c).
+const TEMP_OFFSET_ATTR = 0xff01;
+const TEMP_OFFSET_MANUF = 0x1001;
+
 // Custom converters for the per-endpoint controls. We deliberately do NOT set
 // an `endpoint()` map: Z2M would then publish per-endpoint subtopics
 // (zigbee2mqtt/<name>/led, .../display) on every device message — chatty when
@@ -32,6 +37,15 @@ const fz_local = {
         convert: (model, msg) => {
             if (msg.endpoint.ID !== 2 || msg.data.currentLevel === undefined) return;
             return {display_brightness: msg.data.currentLevel};
+        },
+    },
+    temperature_offset: {
+        cluster: "msTemperatureMeasurement",
+        type: ["attributeReport", "readResponse"],
+        convert: (model, msg) => {
+            const raw = msg.data[TEMP_OFFSET_ATTR];
+            if (raw === undefined) return;
+            return {temperature_offset: raw / 100};
         },
     },
 };
@@ -73,6 +87,19 @@ const tz_local = {
             await meta.device.getEndpoint(2).read("genLevelCtrl", ["currentLevel"]);
         },
     },
+    temperature_offset: {
+        key: ["temperature_offset"],
+        convertSet: async (entity, key, value, meta) => {
+            const raw = Math.round(Number(value) * 100);
+            const ep = meta.device.getEndpoint(1);
+            await ep.write("msTemperatureMeasurement", {[TEMP_OFFSET_ATTR]: {value: raw, type: 0x29}}, {manufacturerCode: TEMP_OFFSET_MANUF});
+            return {state: {temperature_offset: raw / 100}};
+        },
+        convertGet: async (entity, key, meta) => {
+            const ep = meta.device.getEndpoint(1);
+            await ep.read("msTemperatureMeasurement", [TEMP_OFFSET_ATTR], {manufacturerCode: TEMP_OFFSET_MANUF});
+        },
+    },
 };
 
 export default {
@@ -84,10 +111,19 @@ export default {
     // (bind + configureReporting) for us.
     extend: [m.temperature(), m.humidity(), m.co2()],
     // Custom controls (LED on ep 1, optional OLED display on ep 2).
-    fromZigbee: [fz_local.co2_led, fz_local.display_state, fz_local.display_brightness],
-    toZigbee: [tz_local.co2_led, tz_local.display, tz_local.display_brightness],
+    fromZigbee: [fz_local.co2_led, fz_local.display_state, fz_local.display_brightness, fz_local.temperature_offset],
+    toZigbee: [tz_local.co2_led, tz_local.display, tz_local.display_brightness, tz_local.temperature_offset],
     exposes: (device) => {
-        const list = [e.binary("co2_led", ea.ALL, "ON", "OFF").withDescription("CO2 level indicator LED")];
+        const list = [
+            e.binary("co2_led", ea.ALL, "ON", "OFF").withDescription("CO2 level indicator LED"),
+            e
+                .numeric("temperature_offset", ea.ALL)
+                .withValueMin(-10)
+                .withValueMax(10)
+                .withValueStep(0.1)
+                .withUnit("°C")
+                .withDescription("Temperature calibration offset (subtracted from raw reading)"),
+        ];
         if (device?.getEndpoint?.(2)) {
             list.push(
                 e.binary("display", ea.ALL, "ON", "OFF").withDescription("OLED display power"),
@@ -99,6 +135,9 @@ export default {
     configure: async (device, coordinatorEndpoint) => {
         const ep1 = device.getEndpoint(1);
         await ep1.bind("genOnOff", coordinatorEndpoint);
+
+        // Seed the offset value in Z2M's state right after pairing.
+        await ep1.read("msTemperatureMeasurement", [TEMP_OFFSET_ATTR], {manufacturerCode: TEMP_OFFSET_MANUF});
 
         const ep2 = device.getEndpoint(2);
         if (ep2) {
