@@ -60,10 +60,14 @@ static const char *TAG = "CO2_ZB";
 // Zigbee Configuration
 // ---------------------------------------------------------------
 #define ZB_ENDPOINT 1
+#define ZB_DISPLAY_ENDPOINT 2
 #define CO2_CLUSTER_ID 0x040D
 #define CO2_ATTR_MEASURED 0x0000
 #define CO2_ATTR_MIN 0x0001
 #define CO2_ATTR_MAX 0x0002
+
+// SSD1306 default contrast (matches init_seq value in display.c).
+#define DISPLAY_BRIGHTNESS_DEFAULT 0x8F
 
 #define MEASURE_INTERVAL_MS 10000
 #ifndef TEMP_OFFSET_C
@@ -73,7 +77,7 @@ static const char *TAG = "CO2_ZB";
 // OTA configuration
 // OTA_UPGRADE_FILE_VERSION encodes semver as 0xMMmmppbb (major.minor.patch.build).
 // Keep in sync with PROJECT_VER in CMakeLists.txt.
-#define OTA_UPGRADE_FILE_VERSION    0x01000000
+#define OTA_UPGRADE_FILE_VERSION    0x01010000
 #define OTA_UPGRADE_MANUFACTURER    0x1001
 #define OTA_UPGRADE_IMAGE_TYPE      0x1011
 #define OTA_UPGRADE_HW_VERSION      0x0001
@@ -90,6 +94,8 @@ static const char *TAG = "CO2_ZB";
 static volatile bool zb_connected = false;
 static volatile uint16_t last_co2_ppm = 0;
 static volatile bool co2_led_enabled = CO2_LED_DEFAULT;
+static volatile bool display_power = true;
+static volatile uint8_t display_brightness = DISPLAY_BRIGHTNESS_DEFAULT;
 
 // CO2 attribute storage (must be static for Zigbee references)
 static float co2_val = 0.0f;
@@ -587,8 +593,20 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     }
     if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
         m->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
-      co2_led_enabled = *(bool *)m->attribute.data.value;
-      ESP_LOGI(TAG, "CO2 LED %s", co2_led_enabled ? "enabled" : "disabled");
+      bool v = *(bool *)m->attribute.data.value;
+      if (m->info.dst_endpoint == ZB_DISPLAY_ENDPOINT) {
+        display_power = v;
+        display_set_power(v);
+      } else {
+        co2_led_enabled = v;
+        ESP_LOGI(TAG, "CO2 LED %s", co2_led_enabled ? "enabled" : "disabled");
+      }
+    }
+    if (m->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL &&
+        m->attribute.id == ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID &&
+        m->info.dst_endpoint == ZB_DISPLAY_ENDPOINT) {
+      display_brightness = *(uint8_t *)m->attribute.data.value;
+      display_set_brightness(display_brightness);
     }
     return ESP_OK;
   }
@@ -644,8 +662,6 @@ static void sensor_task(void *arg)
     ESP_LOGW(TAG, "SCD41 init failed, retrying in 5s...");
     vTaskDelay(pdMS_TO_TICKS(5000));
   }
-
-  display_init(i2c_bus);
 
   while (1)
   {
@@ -798,6 +814,31 @@ static void esp_zb_task(void *arg)
   };
   esp_zb_ep_list_add_ep(ep_list, cluster_list, ep_cfg);
 
+  // --- Display control endpoint (dimmable light): On/Off + Level Control ---
+  // Only registered when an OLED was detected at boot — keeps the bedroom
+  // (no display) from advertising controls that go nowhere.
+  if (display_is_present()) {
+    esp_zb_attribute_list_t *disp_identify =
+        esp_zb_identify_cluster_create(&(esp_zb_identify_cluster_cfg_t){.identify_time = 0});
+    esp_zb_attribute_list_t *disp_onoff =
+        esp_zb_on_off_cluster_create(&(esp_zb_on_off_cluster_cfg_t){.on_off = display_power});
+    esp_zb_attribute_list_t *disp_level =
+        esp_zb_level_cluster_create(&(esp_zb_level_cluster_cfg_t){.current_level = display_brightness});
+
+    esp_zb_cluster_list_t *disp_clusters = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_identify_cluster(disp_clusters, disp_identify, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_on_off_cluster(disp_clusters, disp_onoff, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_level_cluster(disp_clusters, disp_level, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_endpoint_config_t disp_ep_cfg = {
+        .endpoint = ZB_DISPLAY_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_DIMMABLE_LIGHT_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, disp_clusters, disp_ep_cfg);
+  }
+
   // --- Register device ---
   esp_zb_device_register(ep_list);
   esp_zb_core_action_handler_register(zb_action_handler);
@@ -857,6 +898,12 @@ void app_main(void)
   }
   ESP_ERROR_CHECK(ret);
 
+  // Probe for the OLED before Zigbee starts so esp_zb_task can decide whether
+  // to register the display endpoint. i2c_init() is idempotent — scd41_init()
+  // will reuse the bus when sensor_task starts.
+  if (i2c_init() == ESP_OK) {
+    display_init(i2c_bus);
+  }
 
   esp_zb_platform_config_t platform_cfg = {
       .radio_config = {

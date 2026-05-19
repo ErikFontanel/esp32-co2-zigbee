@@ -14,6 +14,7 @@
 static const char *TAG = "OLED";
 static i2c_master_dev_handle_t oled_dev = NULL;
 static bool oled_present = false;
+static bool oled_on = true;
 static uint8_t fb[SSD1306_W * SSD1306_PAGES];
 
 // 6x8 font, ASCII 32-126.  Each glyph is 6 columns, LSB = top pixel.
@@ -146,6 +147,32 @@ static esp_err_t oled_send_fb(void)
     return i2c_master_transmit(oled_dev, buf, sizeof(buf), I2C_TIMEOUT);
 }
 
+bool display_is_present(void)
+{
+    return oled_present;
+}
+
+void display_set_power(bool on)
+{
+    if (!oled_present || oled_on == on) return;
+    oled_on = on;
+    if (on) {
+        oled_cmd(0xAF);   // display on
+        oled_send_fb();   // push current readings now that panel is visible
+    } else {
+        oled_cmd(0xAE);   // display off
+    }
+    ESP_LOGI(TAG, "display %s", on ? "on" : "off");
+}
+
+void display_set_brightness(uint8_t level)
+{
+    if (!oled_present) return;
+    uint8_t cmd[2] = {0x81, level};
+    oled_cmds(cmd, sizeof(cmd));
+    ESP_LOGI(TAG, "brightness=%u", level);
+}
+
 static void fb_clear(void)
 {
     memset(fb, 0, sizeof(fb));
@@ -262,5 +289,7 @@ void display_update(uint16_t co2_ppm, float temp_c, float rh_pct)
     snprintf(buf, sizeof(buf), "%.1f %%", rh_pct);
     fb_puts(66, 3, buf);
 
-    oled_send_fb();
+    // Always keep fb fresh, but skip the I2C burst while panel is off — it'll
+    // get pushed on the next display_set_power(true).
+    if (oled_on) oled_send_fb();
 }
