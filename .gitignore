@@ -13,3 +13,5 @@ build/
 .claude/settings.local.json
 compile_commands.json
 node_modules/
+.claude/worktrees/
+.claude/.settings.local.json
